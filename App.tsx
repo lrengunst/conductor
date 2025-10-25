@@ -1,80 +1,50 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { Conductor } from './services/conductor';
 import { registry } from './services/tasks';
 import Card from './components/Card';
 import Spinner from './components/Spinner';
 
-// GIẢI PHÁP: Nhúng trực tiếp mã nguồn của worker vào đây dưới dạng một chuỗi.
-// Điều này loại bỏ sự phụ thuộc vào các trình nạp (loader) đặc thù của bundler.
-const workerCode = `
-// LƯU Ý QUAN TRỌNG:
-// File này không phải là một module JavaScript thông thường.
-// Nó sẽ được chuyển thành chuỗi và thực thi trong một môi trường worker.
-// Biến 'registry' được giả định là đã tồn tại trong scope toàn cục của worker
-// sau khi được "tiêm" vào bởi lớp Conductor.
-
-self.onmessage = (event) => {
-    const { id, name, args } = event.data;
-
-    if (!id || !name) {
-        console.error('Tác vụ không hợp lệ từ luồng chính:', event.data);
-        return;
-    }
-    
-    // Giả định 'registry' đã được định nghĩa trong scope này bởi Conductor.
-    const fn = self.registry[name];
-    if (typeof fn !== 'function') {
-        self.postMessage({ id, error: \`Tác vụ '\${name}' không tồn tại trong sổ đăng ký.\` });
-        return;
-    }
-
-    try {
-        const result = fn(...args);
-        
-        const transferables = [];
-        if (result instanceof ArrayBuffer) {
-            transferables.push(result);
-        } else if (result && result.buffer instanceof ArrayBuffer) {
-            transferables.push(result.buffer);
-        }
-
-        self.postMessage({ id, result }, { transfer: transferables });
-
-    } catch (e) {
-        self.postMessage({ id, error: e.message });
-    }
-};
-`;
-
+const GITHUB_RAW_URL = 'https://raw.githubusercontent.com/lrengunst/conductor/main/';
 
 const App: React.FC = () => {
-    const [status, setStatus] = useState<string>('Sẵn sàng');
+    const [status, setStatus] = useState<string>('Đang tải tài nguyên...');
     const [main, setMain] = useState<number | null>(null);
     const [parallel, setParallel] = useState<number | null>(null);
     const [processing, setProcessing] = useState(false);
-    const conductor = useRef<Conductor | null>(null);
+    const [conductor, setConductor] = useState<Conductor | null>(null);
 
     useEffect(() => {
-        // Khởi tạo Conductor một lần khi component được mount
-        const cores = navigator.hardwareConcurrency || 4;
-        setStatus(`Khởi tạo Conductor với ${cores} worker...`);
-        conductor.current = new Conductor(workerCode, registry, cores);
-        setStatus('Sẵn sàng');
-
-        // Dọn dẹp khi component unmount
-        return () => {
-            conductor.current?.terminate();
-            setStatus('Đã dọn dẹp');
+        const initialize = async () => {
+            try {
+                const cores = navigator.hardwareConcurrency || 4;
+                setStatus(`Đang nạp mã nguồn worker từ GitHub...`);
+                const conductorInstance = await Conductor.create(GITHUB_RAW_URL, cores);
+                setConductor(conductorInstance);
+                setStatus(`Sẵn sàng với ${cores} worker.`);
+            } catch (error) {
+                console.error("Lỗi khởi tạo Conductor:", error);
+                setStatus('Lỗi khởi tạo. Vui lòng làm mới trang.');
+            }
         };
-    }, []);
+
+        initialize();
+
+        return () => {
+            conductor?.terminate();
+        };
+    }, []); // Phụ thuộc rỗng để chỉ chạy một lần
 
     const process = useCallback(async (mode: 'main' | 'parallel') => {
+        if (!conductor && mode === 'parallel') {
+            setStatus("Lỗi: Conductor chưa được khởi tạo.");
+            return;
+        }
+
         setProcessing(true);
         setMain(null);
         setParallel(null);
         setStatus(`Đang chuẩn bị dữ liệu ảnh (2048x2048)...`);
 
-        // Sử dụng `setTimeout` để cho phép UI cập nhật trước khi bắt đầu tác vụ nặng
         await new Promise(resolve => setTimeout(resolve, 50));
 
         const width = 2048;
@@ -89,22 +59,20 @@ const App: React.FC = () => {
         if (mode === 'main') {
             setStatus('Đang xử lý trên luồng chính...');
             await new Promise(resolve => setTimeout(resolve, 50));
-            registry.invert(buffer); // Chạy trực tiếp
+            registry.invert(buffer);
             const end = performance.now();
             setMain(end - start);
             setStatus('Hoàn thành trên luồng chính.');
-        } else if (mode === 'parallel' && conductor.current) {
+        } else if (mode === 'parallel' && conductor) {
             setStatus('Đang xử lý song song với workers...');
             await new Promise(resolve => setTimeout(resolve, 50));
-            const c = conductor.current;
             const cores = navigator.hardwareConcurrency || 4;
             const size = Math.ceil(buffer.length / cores);
             const promises = [];
 
             for (let i = 0; i < cores; i++) {
                 const chunk = buffer.slice(i * size, (i + 1) * size);
-                // Chúng ta cần gửi ArrayBuffer, không phải TypedArray, để có thể chuyển giao.
-                promises.push(c.submit('invert', chunk.buffer)); 
+                promises.push(conductor.submit('invert', chunk)); 
             }
             
             await Promise.all(promises);
@@ -114,7 +82,7 @@ const App: React.FC = () => {
         }
 
         setProcessing(false);
-    }, []);
+    }, [conductor]);
 
 
     return (
@@ -132,16 +100,16 @@ const App: React.FC = () => {
                     <div className="flex flex-col md:flex-row gap-6">
                         <button
                             onClick={() => process('main')}
-                            disabled={processing}
-                            className="w-full md:w-1/2 bg-red-600 hover:bg-red-700 disabled:bg-red-900 disabled:cursor-not-allowed text-white font-bold py-3 px-6 rounded-lg transition-transform transform hover:scale-105"
+                            disabled={!conductor || processing}
+                            className="w-full md:w-1/2 bg-red-600 hover:bg-red-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white font-bold py-3 px-6 rounded-lg transition-transform transform hover:scale-105"
                         >
                            {processing && <div className="inline-block animate-spin rounded-full h-5 w-5 border-b-2 border-white mr-2"></div>}
                             Chạy trên Luồng chính (Sẽ đóng băng UI)
                         </button>
                         <button
                             onClick={() => process('parallel')}
-                            disabled={processing}
-                            className="w-full md:w-1/2 bg-cyan-600 hover:bg-cyan-700 disabled:bg-cyan-900 disabled:cursor-not-allowed text-white font-bold py-3 px-6 rounded-lg transition-transform transform hover:scale-105"
+                            disabled={!conductor || processing}
+                            className="w-full md:w-1/2 bg-cyan-600 hover:bg-cyan-700 disabled:bg-gray-600 disabled:cursor-not-allowed text-white font-bold py-3 px-6 rounded-lg transition-transform transform hover:scale-105"
                         >
                             {processing && <div className="inline-block animate-spin rounded-full h-5 w-5 border-b-2 border-white mr-2"></div>}
                             Chạy song song với Conductor

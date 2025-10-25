@@ -1,4 +1,4 @@
-import type { Task, Work, Report } from '../types';
+import type { Task, Work, Report } from '../../types';
 
 /**
  * @description  Một trình điều phối hiệu suất cao quản lý một bể chứa Web Worker cho các tác vụ song song.
@@ -6,11 +6,12 @@ import type { Task, Work, Report } from '../types';
  * @solves       1. Đóng băng Giao diện Người dùng (UI Freeze) do các tác vụ tính toán nặng.
  *               2. Chi phí giao tiếp dữ liệu lớn giữa các luồng.
  *               3. Sử dụng không hiệu quả CPU đa lõi.
- *               4. Vấn đề bảo mật và bảo trì của việc thực thi mã động (`new Function`).
- * @model        Mô hình Bể chứa Worker (Worker Pool) và Sổ đăng ký Tác vụ (Task Registry).
+ *               4. Vấn đề bảo mật và bảo trì của việc thực thi mã động.
+ *               5. Sự khó khăn trong việc phát triển mã nguồn worker khi phải nhúng dưới dạng chuỗi.
+ * @model        Mô hình Bể chứa Worker (Worker Pool), Sổ đăng ký Tác vụ (Task Registry), và Trình nạp Động (Dynamic Loader).
  * @algorithm    Lập lịch tác vụ bằng hàng đợi FIFO (First-In, First-Out).
- * @complexity   Gửi tác vụ: O(1). Xử lý song song: Lý tưởng là O(N/P) với N là kích thước dữ liệu và P là số worker.
- * @rationale    Sử dụng một 'Sổ đăng ký tác vụ' (Task Registry) thay vì truyền mã dưới dạng chuỗi để thực thi giúp loại bỏ hoàn toàn rủi ro an ninh (Code Injection) và cải thiện đáng kể khả năng bảo trì và gỡ lỗi. Mã worker được xây dựng một lần lúc khởi tạo, kết hợp sổ đăng ký và logic lõi, sau đó được biến thành một URL đối tượng (Object URL) để tạo worker, giải quyết vấn đề của môi trường hạn chế.
+ * @complexity   Khởi tạo: O(1) + chi phí mạng. Gửi tác vụ: O(1). Xử lý song song: Lý tưởng là O(N/P).
+ * @rationale    Sử dụng một phương thức factory `async static create` để nạp mã nguồn từ một URL ổn định. Điều này cho phép mã nguồn worker và tasks được phát triển như các module tiêu chuẩn, cải thiện đáng kể khả năng bảo trì và trải nghiệm lập trình viên. Mã nguồn sau khi được nạp sẽ được biên dịch tại trình duyệt thành một Blob URL, giải quyết hoàn toàn vấn đề của môi trường hạn chế.
  */
 export class Conductor {
     private workers: Worker[] = [];
@@ -19,13 +20,28 @@ export class Conductor {
     private tasks = new Map<string, { resolve: (value: any) => void; reject: (reason?: any) => void }>();
 
     /**
-     * @description Khởi tạo Conductor và tạo ra bể chứa worker.
-     * @param {string} code Chuỗi mã nguồn của logic worker.
-     * @param {object} registry Sổ đăng ký các hàm có thể thực thi.
-     * @param {number} size Kích thước của bể chứa, mặc định là số lõi logic của CPU.
+     * @description Tạo và khởi tạo một instance Conductor.
+     * @param {string} baseUrl URL gốc để nạp mã nguồn.
+     * @param {number} size Kích thước của bể chứa worker.
+     * @returns {Promise<Conductor>} Một promise sẽ resolve với instance Conductor đã sẵn sàng.
      */
-    constructor(code: string, registry: object, size: number = navigator.hardwareConcurrency || 2) {
-        const script = this.compile(registry, code);
+    public static async create(baseUrl: string, size: number = navigator.hardwareConcurrency || 2): Promise<Conductor> {
+        const [workerCode, tasksCode] = await Promise.all([
+            fetch(`${baseUrl}services/worker/index.ts`).then(res => res.text()),
+            fetch(`${baseUrl}services/tasks/index.ts`).then(res => res.text()),
+        ]);
+        return new Conductor(workerCode, tasksCode, size);
+    }
+
+    /**
+     * @description Constructor là private để ép buộc việc sử dụng phương thức `create` bất đồng bộ.
+     * @param {string} workerCode Chuỗi mã nguồn của logic worker.
+     * @param {string} tasksCode Chuỗi mã nguồn của sổ đăng ký tác vụ.
+     * @param {number} size Kích thước của bể chứa.
+     * @private
+     */
+    private constructor(workerCode: string, tasksCode: string, size: number) {
+        const script = this.compile(tasksCode, workerCode);
         const blob = new Blob([script], { type: 'application/javascript' });
         const url = URL.createObjectURL(blob);
 
@@ -50,10 +66,8 @@ export class Conductor {
             const transfer = args.filter(arg => arg instanceof ArrayBuffer || (arg && arg.buffer instanceof ArrayBuffer))
                                 .map(arg => arg.buffer instanceof ArrayBuffer ? arg.buffer : arg);
             
-            // Xử lý trường hợp đối số là TypedArray, chuyển đổi về ArrayBuffer để chuyển giao
             const finalArgs = args.map(arg => {
                 if (arg && arg.buffer instanceof ArrayBuffer && !(arg instanceof ArrayBuffer)) {
-                    // Đây là một TypedArray, chúng ta cần tái tạo nó trong worker
                     return { __type: 'TypedArray', buffer: arg.buffer, constructor: arg.constructor.name };
                 }
                 return arg;
@@ -104,8 +118,7 @@ export class Conductor {
                 task.reject(new Error(report.error));
             } else {
                 let result = report.result;
-                // Tái tạo TypedArray từ buffer nếu cần
-                 if (result && result.__type === 'TypedArray' && result.buffer) {
+                if (result && result.__type === 'TypedArray' && result.buffer) {
                     const constructor = self[result.constructor as keyof typeof self] as any;
                     if (constructor && typeof constructor === 'function') {
                        result = new constructor(result.buffer);
@@ -120,22 +133,17 @@ export class Conductor {
     }
     
     /**
-     * @description Biên dịch sổ đăng ký và mã nguồn lõi thành một chuỗi script hoàn chỉnh.
-     * @param {object} registry Đối tượng sổ đăng ký.
-     * @param {string} code Mã nguồn lõi của worker.
+     * @description Biên dịch mã nguồn của tasks và worker thành một script hoàn chỉnh.
+     * @param {string} tasksCode Mã nguồn của file tasks.
+     * @param {string} workerCode Mã nguồn lõi của worker.
      * @returns {string} Một chuỗi mã JavaScript sẵn sàng để thực thi.
      * @private
      */
-    private compile(registry: object, code: string): string {
-        const functions = Object.entries(registry)
-            .map(([name, fn]) => `const ${name} = ${fn.toString()};`)
-            .join('\n');
-            
-        const registryObject = `const registry = { ${Object.keys(registry).join(', ')} };`;
+    private compile(tasksCode: string, workerCode: string): string {
+        // Loại bỏ các từ khóa `export` để chạy trong worker scope
+        const cleanTasksCode = tasksCode.replace(/export /g, '');
         
-        // CẬP NHẬT: Gán registry vào scope toàn cục của worker (`self`)
-        // để mã nguồn trong `code` có thể truy cập nó.
-        const finalScript = `${functions}\n${registryObject}\n\nself.registry = registry;\n\n${code}`;
+        const finalScript = `${cleanTasksCode}\n\nself.registry = registry;\n\n${workerCode}`;
 
         return finalScript;
     }
