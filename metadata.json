@@ -1,0 +1,5 @@
+{
+  "name": "Conductor - Trình điều phối Worker song song",
+  "description": "Một ứng dụng React minh họa một framework hiệu suất cao để quản lý một bể chứa Web Worker, xử lý các tác vụ nặng song song mà không đóng băng giao diện người dùng. Giải pháp được thiết kế đặc biệt cho các môi trường không cho phép nạp worker từ URL động.",
+  "requestFramePermissions": []
+}
