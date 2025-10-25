@@ -27,8 +27,8 @@ export class Conductor {
      */
     public static async create(baseUrl: string, size: number = navigator.hardwareConcurrency || 2): Promise<Conductor> {
         const [workerCode, tasksCode] = await Promise.all([
-            fetch(`${baseUrl}services/worker/index.ts`).then(res => res.text()),
-            fetch(`${baseUrl}services/tasks/index.ts`).then(res => res.text()),
+            fetch(`${baseUrl}services/worker/index.js`).then(res => res.text()),
+            fetch(`${baseUrl}services/tasks/index.js`).then(res => res.text()),
         ]);
         return new Conductor(workerCode, tasksCode, size);
     }
